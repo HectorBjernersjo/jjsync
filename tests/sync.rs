@@ -1136,6 +1136,11 @@ fn cli_local_config_bootstrap_and_ignore() {
     );
     assert!(local_text.contains("machine-a-work"));
     assert!(local_text.contains(&work_remote.display().to_string()));
+    assert_eq!(
+        fs::read_to_string(cfg_dir.join(".gitignore")).unwrap(),
+        "config.local.json\n",
+        "the config dir must be safe to track in dotfiles"
+    );
 
     // One sync covers both config files.
     run_cli(&["sync"], &w.root, &w.env);

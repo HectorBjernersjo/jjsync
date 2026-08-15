@@ -75,13 +75,29 @@ impl RepoConfig {
         expand_tilde(&self.path)
     }
 
-    /// Display name for status lines: last path component.
+    /// Display name for status lines: the repo's own name, taken from the
+    /// remote URL — a clone parked in `~/projects/gbandit/main` is "gbandit",
+    /// not "main". Falls back to the last path component when no URL is
+    /// recorded (pre-`url` configs, or a repo without a remote).
     pub fn name(&self) -> String {
-        self.expanded_path()
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.clone())
+        self.url
+            .as_deref()
+            .and_then(repo_name_from_url)
+            .unwrap_or_else(|| {
+                self.expanded_path()
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| self.path.clone())
+            })
     }
+}
+
+/// The repo name inside a git URL: last segment, minus any `.git`. Handles
+/// `https://host/org/repo.git` and the scp-like `git@host:org/repo` alike.
+pub fn repo_name_from_url(url: &str) -> Option<String> {
+    let last = url.trim_end_matches('/').rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 pub fn expand_tilde(path: &str) -> PathBuf {
@@ -128,6 +144,13 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
+            // The shared config is meant to be tracked in dotfiles; a nested
+            // .gitignore keeps the machine-local file from traveling with it.
+            let gitignore = dir.join(".gitignore");
+            if !gitignore.exists() {
+                std::fs::write(&gitignore, "config.local.json\n")
+                    .with_context(|| format!("writing {}", gitignore.display()))?;
+            }
         }
         let mut text = serde_json::to_string_pretty(self)?;
         text.push('\n');
@@ -150,14 +173,20 @@ impl Config {
 }
 
 /// The repo list this machine acts on: shared repos plus local ones, minus
-/// anything named in either file's `ignoreRepos` (by path or directory name).
+/// anything named in either file's `ignoreRepos` (by path, repo name or
+/// directory name — the name comes from the remote URL, which can differ).
 pub fn effective_repos(shared: &Config, local: &Config) -> Vec<RepoConfig> {
     let ignored = |r: &RepoConfig| {
         shared
             .ignore_repos
             .iter()
             .chain(&local.ignore_repos)
-            .any(|i| *i == r.name() || expand_tilde(i) == r.expanded_path())
+            .any(|i| {
+                let path = r.expanded_path();
+                *i == r.name()
+                    || path.file_name().is_some_and(|d| d == i.as_str())
+                    || expand_tilde(i) == path
+            })
     };
     shared
         .repos

@@ -81,8 +81,9 @@ clones whatever is missing using each repo's `url`. Machine-only state goes in
 `config.local.json` next to it, which is never meant to leave the machine: its
 `repos` are added to the shared list (register with `jjsync init --local` —
 e.g. a work repo that shouldn't appear in personal dotfiles), and its
-`ignoreRepos` (paths or directory names) opts this machine out of shared
-repos:
+`ignoreRepos` (paths, repo names or directory names) opts this machine out of
+shared repos. jjsync drops a `.gitignore` with `config.local.json` in the config
+directory, so tracking the whole directory in your dotfiles is safe:
 
 ```json
 {
