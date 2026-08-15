@@ -32,9 +32,9 @@ every 60 s (configurable in `~/.config/jjsync/config.json`).
 ## Commands
 
 ```text
-jjsync init        register cwd repo (or extra workspace) in the config
+jjsync init        register the cwd repo in the config
 jjsync sync        run one cycle for all repos (what the timer fires)
-jjsync status      per-repo state; one line per problem, ✓ when healthy
+jjsync status      one line per repo (✓/○/⚠ + last-sync age), plus timer health
 jjsync resolve X   unfreeze diverged bookmark X: local position wins
 jjsync pause       stop the timer
 jjsync resume      start the timer
@@ -64,8 +64,9 @@ raise a desktop notification and show in `jjsync status`. Offline is a non-event
 
 `refPrefix` can point into a branch namespace (e.g.
 `refs/heads/users/you/jjsync/`) where custom namespaces are blocked. The leak
-gate scans every outgoing commit with gitleaks; allowlist false positives with a
-`.gitleaks.toml` in the repo, or set `"leakScan": false` per repo.
+gate scans every outgoing commit with gitleaks; ignore a false positive by
+putting a `gitleaks:allow` comment on the offending line, allowlist patterns
+repo-wide with a `.gitleaks.toml`, or set `"leakScan": false` per repo.
 
 ## Development
 

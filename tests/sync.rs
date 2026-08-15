@@ -333,10 +333,10 @@ fn described_commit_travels_as_ancestor() {
     assert!(w.remote_ref("refs/heads/main").is_none());
 }
 
-/// A planted secret blocks that repo's publish until fixed; local jj use and
-/// other repos are unaffected.
+/// A planted secret blocks that repo's publish until fixed or allowlisted;
+/// local jj use and other repos are unaffected.
 #[test]
-fn leak_gate_blocks_until_fixed() {
+fn leak_gate_blocks_until_fixed_or_allowlisted() {
     let w = World::new();
     let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
     let other = w.machine("machine-other"); // an unrelated healthy repo
@@ -347,9 +347,7 @@ fn leak_gate_blocks_until_fixed() {
     a.sync_ok();
     b.sync_ok();
 
-    // The fake PAT is assembled at runtime so jjsync's own source (and thus
-    // its own sync state) never contains a token gitleaks would match.
-    let fake_pat = format!("ghp_{}{}", "Zx9q8W7v6U5t4S3r2Q1p", "0O9n8M7l6K5j4I");
+    let fake_pat = "ghp_Zx9q8W7v6U5t4S3r2Q1p0O9n8M7l6K5j4I"; // gitleaks:allow
     a.write(".env.local", &format!("token={fake_pat}\n"));
     let out = a.sync();
     assert!(
@@ -370,11 +368,27 @@ fn leak_gate_blocks_until_fixed() {
     other.write("other.txt", "other\n");
     other.sync_ok();
 
-    // Fixing the file unblocks the repo.
-    a.write(".env.local", "token=redacted\n");
+    // Allowlisting arm: a `gitleaks:allow` comment on the line unblocks —
+    // the user has declared the finding fine, so it syncs as-is.
+    a.write(
+        ".env.local",
+        &format!("token={fake_pat} # gitleaks:allow\n"),
+    );
     a.sync_ok();
     b.sync_ok();
-    assert_eq!(b.read(".env.local").trim(), "token=redacted");
+    assert!(b.read(".env.local").contains(fake_pat));
+
+    // Fixing arm: a fresh secret blocks again; removing it unblocks.
+    a.write("cred.txt", &format!("key={fake_pat}\n"));
+    let out = a.sync();
+    assert!(out
+        .problems
+        .iter()
+        .any(|p| matches!(p, Problem::LeakBlocked { .. })));
+    a.write("cred.txt", "key=redacted\n");
+    a.sync_ok();
+    b.sync_ok();
+    assert_eq!(b.read("cred.txt").trim(), "key=redacted");
 }
 
 /// Rerunning a cycle changes nothing; a lost S (interrupted cycle, re-clone)
@@ -476,6 +490,179 @@ fn anonymous_heads_create_abandon_resurrect() {
     a.sync_ok();
     let on_a = a.template(&parked_change, "commit_id");
     assert_eq!(on_a, modified, "the modified head must resurrect on A");
+}
+
+/// A chain abandoned on B (abandon + fresh @) must stay abandoned everywhere:
+/// when A adopts the new @, the parents its stale @ exposes must be abandoned
+/// too, not republished as anonymous heads — that republish used to bounce
+/// the whole chain back to B (resurrection loop), with the delayed republish
+/// firing on A's *second* cycle once S had caught up.
+#[test]
+fn abandoned_chain_is_not_resurrected() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+
+    // Shared chain: root ← "work" (described) ← @ (undescribed, non-empty).
+    a.write("work.txt", "work\n");
+    a.jj(&["describe", "-m", "work"]);
+    let work = a.wc_sha();
+    a.jj(&["new"]);
+    a.write("more.txt", "more\n");
+    a.sync_ok();
+    b.sync_ok();
+    let tip = b.wc_sha();
+    assert_eq!(tip, a.wc_sha());
+
+    // B throws the whole chain away.
+    b.jj(&["new", "root()"]);
+    b.jj(&["abandon", "all() ~ root() ~ @"]);
+    b.sync_ok();
+
+    // A adopts the fresh @ (cycle 1), then cycles again (where the delayed
+    // republish used to fire); B must stay clean afterwards.
+    a.sync_ok();
+    a.sync_ok();
+    b.sync_ok();
+
+    assert_eq!(a.wc_change(), b.wc_change());
+    assert!(!a.dir.join("work.txt").exists());
+    for m in [&a, &b] {
+        assert!(!m.is_visible(&tip), "the old @ must stay abandoned");
+        assert!(!m.is_visible(&work), "the described ancestor must stay abandoned");
+    }
+    assert!(
+        w.remote_ref("refs/jj-sync/heads").is_none(),
+        "no head refs may be published for the abandoned chain"
+    );
+}
+
+/// Divergent twin heads abandoned together must not keep each other alive:
+/// the deleting machine drops the remote refs, and the other machine's
+/// "modified here" sibling guard used to see each twin as the other's live
+/// sibling — deadlocking both into a republish that bounced the whole chain
+/// back. The abandon must also cascade to the twins' exposed parent, or it
+/// resurfaces as a "new" head one cycle later.
+#[test]
+fn divergent_heads_abandoned_together_stay_abandoned() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+
+    // Park a chain root ← "base" (described) ← parked, and move @ elsewhere.
+    a.write("base.txt", "base\n");
+    a.jj(&["describe", "-m", "base"]);
+    let base = a.wc_sha();
+    a.jj(&["new"]);
+    a.write("park.txt", "parked\n");
+    let parked_change = a.wc_change();
+    a.jj(&["new", "root()"]);
+    a.sync_ok();
+    b.sync_ok();
+
+    // Both machines rewrite the parked change concurrently → a divergent
+    // twin pair, both published as anonymous heads.
+    a.jj(&["describe", "-m", "from a", &parked_change]);
+    b.jj(&["describe", "-m", "from b", &parked_change]);
+    a.sync_ok();
+    b.sync_ok();
+    a.sync_ok();
+    let twins: Vec<String> = b
+        .jj(&[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("change_id({parked_change})"),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert_eq!(twins.len(), 2, "expected a divergent pair, got {twins:?}");
+
+    // B throws the twins (and thereby the chain) away.
+    b.jj(&["abandon", "all() ~ root() ~ @"]);
+    b.sync_ok();
+    a.sync_ok(); // A must mirror the abandon, not republish the twins
+    a.sync_ok(); // and not republish the exposed parent one cycle later
+    b.sync_ok();
+
+    for m in [&a, &b] {
+        for t in &twins {
+            assert!(!m.is_visible(t), "twin {t} must stay abandoned");
+        }
+        assert!(!m.is_visible(&base), "the exposed parent must stay abandoned");
+    }
+    assert!(
+        w.remote_ref("refs/jj-sync/heads").is_none(),
+        "no head refs may survive for the abandoned chain"
+    );
+}
+
+/// One machine rewrites the shared @'s change while the other stacks a child
+/// on the old copy: sync must do what jj would have done inside one repo —
+/// rebase the child onto the rewrite — not fork into a divergent change plus
+/// an empty merge commit. Covered in both directions: the stacking machine
+/// syncing second, and the rewriting machine syncing second.
+#[test]
+fn rewrite_propagates_as_rebase_not_merge() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+
+    a.write("f.txt", "shared\n");
+    a.sync_ok();
+    b.sync_ok();
+    let shared_change = a.wc_change();
+
+    // A rewrites the shared change and publishes; B stacked a child on the
+    // old copy and syncs second.
+    a.write("f.txt", "rewritten\n");
+    a.jj(&["describe", "-m", "rewritten"]);
+    b.jj(&["new"]);
+    b.write("stacked.txt", "stacked\n");
+    b.jj(&["describe", "-m", "stacked"]);
+    a.sync_ok();
+    b.sync_ok(); // B rebases its child onto A's rewrite
+    a.sync_ok(); // A adopts the rebased child
+
+    for m in [&a, &b] {
+        assert_eq!(m.read("f.txt"), "rewritten\n");
+        assert_eq!(m.read("stacked.txt"), "stacked\n");
+        assert_eq!(m.template("@", "description").trim(), "stacked");
+        assert_eq!(m.template("@-", "description").trim(), "rewritten");
+        assert_eq!(
+            m.template(&format!("change_id({shared_change})"), "\"x\""),
+            "x",
+            "the rewritten change must have exactly one visible commit"
+        );
+    }
+    assert_eq!(a.wc_sha(), b.wc_sha());
+
+    // Other direction: A rewrites the (new) shared @'s change, but B stacks
+    // on the old copy and publishes first — A syncs holding the rewrite.
+    let stacked_change = a.wc_change();
+    a.write("stacked.txt", "stacked v2\n");
+    b.jj(&["new"]);
+    b.write("top.txt", "top\n");
+    b.jj(&["describe", "-m", "top"]);
+    b.sync_ok();
+    a.sync_ok(); // A rebases the incoming child onto its rewrite and lands on it
+    b.sync_ok(); // B adopts
+
+    for m in [&a, &b] {
+        assert_eq!(m.read("stacked.txt"), "stacked v2\n");
+        assert_eq!(m.read("top.txt"), "top\n");
+        assert_eq!(m.template("@", "description").trim(), "top");
+        assert_eq!(
+            m.template(&format!("change_id({stacked_change})"), "\"x\""),
+            "x",
+            "the rewritten change must have exactly one visible commit"
+        );
+    }
+    assert_eq!(a.wc_sha(), b.wc_sha());
+    assert!(
+        w.remote_ref("refs/jj-sync/heads").is_none(),
+        "a propagated rewrite must not leave stray head refs"
+    );
 }
 
 /// M2: bookmark moves mirror across machines; moving differently on both

@@ -12,7 +12,7 @@ use crate::exec::Env;
 use crate::git::{Git, NetOutcome, RefPush, REMOTE_NS, S_NS};
 use crate::jj::Jj;
 use crate::leak::{self, ScanResult};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -189,22 +189,6 @@ fn is_sync_bookmark(name: &str) -> bool {
     name.starts_with("__jjsync") || name.starts_with("__jj_sync")
 }
 
-fn primary_workspace(jj: &Jj, workspaces: &[(String, String)]) -> Result<String> {
-    let wc = jj.wc_commit()?;
-    let matches: Vec<&String> = workspaces
-        .iter()
-        .filter(|(_, t)| *t == wc)
-        .map(|(n, _)| n)
-        .collect();
-    if matches.iter().any(|n| *n == "default") {
-        return Ok("default".into());
-    }
-    matches
-        .first()
-        .map(|n| n.to_string())
-        .context("could not determine the repo path's workspace")
-}
-
 fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Attempt> {
     let repo_name = cfg.name();
     let path = cfg.expanded_path();
@@ -221,13 +205,16 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
     let mut problems: Vec<Problem> = vec![];
 
     // ---- discover workspaces & snapshot ------------------------------------
+    // Workspace directories come from jj itself (`jj workspace root --name`);
+    // a workspace whose directory is gone or unresolvable is simply skipped,
+    // like a workspace this machine never had.
     let ws_list = jj.workspaces()?;
-    let primary = primary_workspace(&jj, &ws_list)?;
-    let mut synced_ws: Vec<(String, PathBuf)> = vec![(primary.clone(), path.clone())];
-    for (name, dir) in &cfg.workspaces {
-        let dir = crate::config::expand_tilde(dir);
-        if *name != primary && ws_list.iter().any(|(n, _)| n == name) && dir.is_dir() {
-            synced_ws.push((name.clone(), dir));
+    let mut synced_ws: Vec<(String, PathBuf)> = vec![];
+    for (name, _) in &ws_list {
+        if let Some(dir) = jj.workspace_root(name) {
+            if dir.is_dir() {
+                synced_ws.push((name.clone(), dir));
+            }
         }
     }
     for (_, dir) in &synced_ws {
@@ -280,6 +267,9 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
 
     let remote_map = git.refs_with_prefix(REMOTE_NS)?;
     let s_map = git.refs_with_prefix(S_NS)?;
+    // Everything the remote namespace still reaches is protected from the
+    // stale-working-copy cleanup in sync_workspace.
+    let remote_pins: Vec<String> = remote_map.values().cloned().collect();
     let mut pushes: Vec<RefPush> = vec![];
     // Items whose S entry must survive this cycle untouched (frozen bookmarks):
     // letting S catch up with the remote would dissolve the recorded divergence.
@@ -314,6 +304,7 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
                 &l,
                 s,
                 r,
+                &remote_pins,
                 env,
             )?;
         }
@@ -447,20 +438,27 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
 
         let mut h = heads_of(&jj)?;
         // Deleted there: abandon locally only if untouched (still a visible
-        // head, no divergent sibling keeping the change alive).
-        let deleted_there: Vec<String> = h
+        // head, no divergent sibling keeping the change alive). A sibling
+        // itself slated for deletion does not count — divergent twins deleted
+        // together must not deadlock each other alive. The abandon cascades
+        // to exposed parents, or they would resurface as "new" heads next
+        // cycle and bounce the chain back to the deleting machine.
+        let deleted_there: BTreeSet<String> = h
             .iter()
             .filter(|sha| s_heads.contains_key(*sha) && !r_heads.contains_key(*sha))
             .cloned()
             .collect();
         if !deleted_there.is_empty() {
             let chg: BTreeMap<String, String> = jj.visible_commits()?.into_iter().collect();
-            for sha in deleted_there {
-                let Some(c) = chg.get(&sha) else { continue };
-                let has_sibling = chg.iter().any(|(s2, c2)| c2 == c && *s2 != sha);
-                if !has_sibling && !jj.has_children(&sha)? {
-                    jj.abandon(&sha)?;
-                    h.remove(&sha);
+            for sha in &deleted_there {
+                let Some(c) = chg.get(sha) else { continue };
+                let live_sibling = chg
+                    .iter()
+                    .any(|(s2, c2)| c2 == c && s2 != sha && !deleted_there.contains(s2));
+                if !live_sibling && !jj.has_children(sha)? {
+                    for gone in abandon_exposed(&git, &jj, sha, &remote_pins)? {
+                        h.remove(&gone);
+                    }
                 }
                 // else: modified here in some form — edit wins, it stays and
                 // is republished below.
@@ -579,6 +577,7 @@ fn sync_workspace(
     l: &str,
     s: Option<&String>,
     r: Option<&String>,
+    remote_pins: &[String],
     env: &Env,
 ) -> Result<()> {
     let ws_jj = Jj::new(dir, env);
@@ -612,7 +611,12 @@ fn sync_workspace(
         // machine (ADR 0002).
         importer.ensure_visible(r)?;
         ws_jj.edit(r)?;
-        abandon_stale_wc(git, jj, l, local_untouched)?;
+        // Drop the stale byte-identical previous working copy and whatever it
+        // exposes — but only when it was untouched since the last sync, so
+        // nothing with local edits is ever abandoned.
+        if local_untouched {
+            abandon_exposed(git, jj, l, remote_pins)?;
+        }
         return Ok(());
     }
     // Both sides moved: divergence. Ancestor cases degenerate to plain
@@ -627,37 +631,156 @@ fn sync_workspace(
         ws_jj.edit(r)?;
         return Ok(());
     }
+    // No ancestry — but before treating it as a fork, repair cross-machine
+    // rewrites (ADR 0004): a change rewritten on one machine while the other
+    // stacked on the old copy is a rewrite jj could not propagate, not a
+    // fork. After the repair the sides may relate by ancestry again; only
+    // what still doesn't merges.
     importer.ensure_visible(r)?;
-    let merged = ws_jj.new_merge(l, r)?;
+    repair_rewrites(git, jj, &ws_jj, l, r, s)?;
+    let l2 = ws_jj.wc_commit()?;
+    let copies = jj.log_shas(&format!("change_id({})", jj.change_of(r)?))?;
+    let r2 = match copies.as_slice() {
+        [only] => only.clone(),
+        _ => r.clone(),
+    };
+    if l2 == r2 {
+        if l2 != *r {
+            publish(pushes, &l2, Some(r));
+        }
+        return Ok(());
+    }
+    if git.is_ancestor(&r2, &l2)? {
+        publish(pushes, &l2, Some(r));
+        return Ok(());
+    }
+    if git.is_ancestor(&l2, &r2)? {
+        ws_jj.edit(&r2)?;
+        if r2 != *r {
+            publish(pushes, &r2, Some(r));
+        }
+        return Ok(());
+    }
+    let merged = ws_jj.new_merge(&l2, &r2)?;
     publish(pushes, &merged, Some(r));
     Ok(())
 }
 
-/// After adopting, drop the stale byte-identical previous working copy —
-/// guarded so nothing built upon, bookmarked, or independently changed is
-/// ever abandoned. (jj itself auto-abandons an empty undescribed @ on leave.)
-fn abandon_stale_wc(git: &Git, jj: &Jj, old: &str, untouched: bool) -> Result<()> {
-    debug!(
-        "abandon_stale_wc {old}: untouched={untouched} visible={} children={:?}",
-        jj.is_visible(old),
-        jj.has_children(old)
-    );
-    if !untouched || !jj.is_visible(old) || jj.has_children(old)? {
-        return Ok(());
+/// jj propagates a rewrite by rebasing its descendants — but predecessor
+/// records live in each clone's op log and don't travel over git refs, so a
+/// change rewritten on one machine while another machine stacked children on
+/// the old copy arrives as two visible commits of one change. Repair it the
+/// way jj itself would have: rebase the stale copy's children onto the
+/// rewrite and abandon the stale copy. Stale = the copy the last-synced
+/// state S can reach (both machines agreed on it); the other copy is the
+/// rewrite. Anything ambiguous — no S, both or neither copy reachable from
+/// S, three-plus copies, a copy outside this reconcile, a stale copy pinned
+/// by a workspace or local ref — is left alone: genuine divergence stays
+/// divergent and merges in the caller.
+fn repair_rewrites(
+    git: &Git,
+    jj: &Jj,
+    ws_jj: &Jj,
+    l: &str,
+    r: &str,
+    s: Option<&String>,
+) -> Result<()> {
+    let Some(s) = s else { return Ok(()) };
+    // Each pass repairs one change and re-reads the view (a rebase renames
+    // every descendant, invalidating collected shas); each repair removes a
+    // duplicated change, so this terminates.
+    loop {
+        let mut by_change: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (cid, chg) in jj.visible_commits()? {
+            by_change.entry(chg).or_default().push(cid);
+        }
+        let ws_targets: BTreeSet<String> =
+            jj.workspaces()?.into_iter().map(|(_, t)| t).collect();
+        let local_refs: BTreeSet<String> =
+            git.refs_with_prefix("refs/heads/")?.into_values().collect();
+        let mut acted = false;
+        for shas in by_change.values() {
+            let [a, b] = shas.as_slice() else { continue };
+            let (stale, new) = match (git.is_ancestor(a, s)?, git.is_ancestor(b, s)?) {
+                (true, false) => (a, b),
+                (false, true) => (b, a),
+                _ => continue,
+            };
+            let in_reconcile =
+                |sha: &str| -> Result<bool> { Ok(git.is_ancestor(sha, l)? || git.is_ancestor(sha, r)?) };
+            if !in_reconcile(stale)?
+                || !in_reconcile(new)?
+                || ws_targets.contains(stale.as_str())
+                || local_refs.contains(stale.as_str())
+            {
+                continue;
+            }
+            debug!("repairing rewrite: {stale} superseded by {new}");
+            for child in jj.log_shas(&format!("children({stale})"))? {
+                ws_jj.rebase(&child, new)?;
+            }
+            jj.abandon(stale)?;
+            acted = true;
+            break;
+        }
+        if !acted {
+            return Ok(());
+        }
     }
-    let ws_now: Vec<String> = jj.workspaces()?.into_iter().map(|(_, t)| t).collect();
-    if ws_now.iter().any(|t| t == old) {
-        return Ok(());
+}
+
+/// Abandon `start` plus any wreckage the drop exposes: a parent that thereby
+/// becomes an unreferenced head was abandoned on the other machine — a chain
+/// merely parked there is reachable from a heads/* ref published in the same
+/// atomic push that removed the other machine's use of it, so anything
+/// reachable from the fetched remote namespace (`remote_pins`) stays. Guards
+/// keep everything built upon, bookmarked, targeted by a workspace, or
+/// independently changed. A hidden `start` (jj auto-abandons an empty
+/// undescribed @ on leave) still has its parents walked. Returns every
+/// commit abandoned.
+fn abandon_exposed(
+    git: &Git,
+    jj: &Jj,
+    start: &str,
+    remote_pins: &[String],
+) -> Result<Vec<String>> {
+    let ws_now: BTreeSet<String> = jj.workspaces()?.into_iter().map(|(_, t)| t).collect();
+    let local_refs: BTreeSet<String> =
+        git.refs_with_prefix("refs/heads/")?.into_values().collect();
+    let root = jj.log_shas("root()")?;
+    let pinned = |sha: &str| -> Result<bool> {
+        for pin in remote_pins {
+            if git.is_ancestor(sha, pin)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    let mut abandoned = vec![];
+    let mut queue = vec![start.to_string()];
+    while let Some(sha) = queue.pop() {
+        if root.first() == Some(&sha) || pinned(&sha)? {
+            continue;
+        }
+        if !jj.is_visible(&sha) {
+            // Only the start can be freshly hidden (auto-abandoned @); its
+            // parents may still be exposed. Anything else already hidden
+            // needs no walk.
+            if sha == start {
+                queue.extend(jj.parents(&sha)?);
+            }
+            continue;
+        }
+        if jj.has_children(&sha)? || ws_now.contains(&sha) || local_refs.contains(&sha) {
+            continue;
+        }
+        let parents = jj.parents(&sha)?;
+        debug!("abandoning exposed commit {sha}");
+        jj.abandon(&sha)?;
+        abandoned.push(sha);
+        queue.extend(parents);
     }
-    if git
-        .refs_with_prefix("refs/heads/")?
-        .values()
-        .any(|v| v == old)
-    {
-        return Ok(());
-    }
-    debug!("abandoning stale wc {old}");
-    jj.abandon(old)
+    Ok(abandoned)
 }
 
 /// Reconcile one bookmark per the ADR 0003 table. Divergence freezes the

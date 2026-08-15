@@ -44,6 +44,27 @@ pub fn install(interval_seconds: u64, env: &Env) -> Result<()> {
     Ok(())
 }
 
+/// One-line timer health for `jjsync status`. None when systemd is disabled
+/// or systemctl is unavailable.
+pub fn timer_status(interval_seconds: u64, env: &Env) -> Option<String> {
+    if systemd_disabled() {
+        return None;
+    }
+    let out = run(
+        "systemctl",
+        &["--user", "is-active", "jjsync.timer"],
+        Path::new("/"),
+        env,
+    )
+    .ok()?;
+    let state = out.stdout.trim();
+    Some(if state == "active" {
+        format!("timer: active (every {interval_seconds}s)")
+    } else {
+        format!("timer: {state} — run `jjsync resume`")
+    })
+}
+
 pub fn pause(env: &Env) -> Result<()> {
     systemctl(&["stop", "jjsync.timer"], env)
 }

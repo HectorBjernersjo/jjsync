@@ -66,6 +66,15 @@ impl<'a> Jj<'a> {
             .collect())
     }
 
+    /// Root directory of a workspace by name (jj records each workspace's
+    /// path in the repo's workspace store). None when the workspace's
+    /// directory no longer resolves on this machine.
+    pub fn workspace_root(&self, name: &str) -> Option<PathBuf> {
+        self.jj_ok(&["workspace", "root", "--ignore-working-copy", "--name", name])
+            .ok()
+            .map(|o| PathBuf::from(o.stdout.trim()))
+    }
+
     /// Commit id of this directory's workspace working copy.
     pub fn wc_commit(&self) -> Result<String> {
         let out = self.jj_ok(&[
@@ -134,6 +143,30 @@ impl<'a> Jj<'a> {
         ])
         .map(|o| o.stdout.trim() == "1")
         .unwrap_or(false)
+    }
+
+    /// Parent commit ids. Works on hidden commits too — revsets resolve a
+    /// hidden commit named by id.
+    pub fn parents(&self, sha: &str) -> Result<Vec<String>> {
+        self.log_shas(&format!("parents({sha})"))
+    }
+
+    pub fn change_of(&self, sha: &str) -> Result<String> {
+        let out = self.jj_ok(&[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            sha,
+            "-T",
+            "change_id",
+        ])?;
+        Ok(out.stdout.trim().to_string())
+    }
+
+    /// `jj rebase -s src -d dest` — moves src and all its descendants.
+    pub fn rebase(&self, src: &str, dest: &str) -> Result<()> {
+        self.jj_ok(&["rebase", "-s", src, "-d", dest]).map(|_| ())
     }
 
     pub fn edit(&self, sha: &str) -> Result<()> {

@@ -2,7 +2,6 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -29,11 +28,6 @@ pub struct RepoConfig {
     pub ref_prefix: String,
     pub leak_scan: bool,
     pub exclude_bookmarks: Vec<String>,
-    /// Extra workspaces of this repo on this machine: name -> directory.
-    /// Auto-populated by running `jjsync init` inside a workspace directory.
-    /// The repo path's own workspace needs no entry.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub workspaces: BTreeMap<String, String>,
 }
 
 impl Default for RepoConfig {
@@ -44,7 +38,6 @@ impl Default for RepoConfig {
             ref_prefix: "refs/jj-sync/".into(),
             leak_scan: true,
             exclude_bookmarks: vec![],
-            workspaces: BTreeMap::new(),
         }
     }
 }

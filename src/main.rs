@@ -3,8 +3,7 @@ use clap::{Parser, Subcommand};
 use jjsync::config::{self, Config, RepoConfig};
 use jjsync::cycle::{sync_repo, CycleOpts};
 use jjsync::exec::Env;
-use jjsync::jj::Jj;
-use jjsync::report::{notify_new_problems, Report};
+use jjsync::report::{self, notify_new_problems, Report};
 
 #[derive(Parser)]
 #[command(
@@ -22,7 +21,7 @@ enum Command {
     Init,
     /// Run one sync cycle for all repos (what the timer fires)
     Sync,
-    /// Per-repo state; one line per problem, ✓ when healthy
+    /// Per-repo state on one line each, plus last-sync age and timer health
     Status,
     /// Unfreeze a diverged bookmark: the local position wins
     Resolve { bookmark: String },
@@ -53,6 +52,7 @@ fn sync(resolve: Vec<String>) -> Result<()> {
         ..Default::default()
     };
     let report = Report {
+        when: report::unix_now(),
         repos: cfg
             .repos
             .iter()
@@ -68,10 +68,12 @@ fn sync(resolve: Vec<String>) -> Result<()> {
 }
 
 fn status() -> Result<()> {
-    let state = config::state_path();
-    match Report::load(&state) {
-        Some(report) => print!("{}", report.render()),
-        None => println!("no sync has run yet"),
+    let cfg = Config::load(&config::config_path())?;
+    let configured: Vec<String> = cfg.repos.iter().map(|r| r.name()).collect();
+    let report = Report::load(&config::state_path()).unwrap_or_default();
+    print!("{}", report.render(&configured, report::unix_now()));
+    if let Some(line) = jjsync::systemd::timer_status(cfg.interval_seconds, &Env::default()) {
+        println!("{line}");
     }
     Ok(())
 }
@@ -83,43 +85,27 @@ fn init() -> Result<()> {
     let mut cfg = Config::load(&cfg_path)?;
     let env = Env::default();
 
-    if root.join(".git").exists() {
-        // Colocated main repo.
-        if cfg.find_repo_mut(&root).is_some() {
-            println!("{} is already registered", root.display());
-        } else {
-            cfg.repos.push(RepoConfig {
-                path: root.display().to_string(),
-                ..Default::default()
-            });
-            println!("registered {}", root.display());
-        }
+    // Running init inside a secondary workspace registers the main repo —
+    // workspaces are auto-discovered every cycle via `jj workspace root`.
+    let main = if root.join(".git").exists() {
+        root
     } else {
-        // A workspace directory: register its path under the main repo entry.
-        let main = config::workspace_main_repo(&root)?;
-        if !main.join(".git").exists() {
-            bail!(
-                "{} is not colocated (no .git beside .jj) — jjsync requires colocated repos",
-                main.display()
-            );
-        }
-        let jj = Jj::new(&root, &env);
-        let wc = jj.wc_commit()?;
-        let workspaces = jj.workspaces()?;
-        let name = workspaces
-            .iter()
-            .find(|(_, t)| *t == wc)
-            .map(|(n, _)| n.clone())
-            .context("could not determine this workspace's name")?;
-        let repo = cfg.find_repo_mut(&main).with_context(|| {
-            format!(
-                "main repo {} is not registered — run `jjsync init` there first",
-                main.display()
-            )
-        })?;
-        repo.workspaces
-            .insert(name.clone(), root.display().to_string());
-        println!("registered workspace '{name}' of {}", main.display());
+        config::workspace_main_repo(&root)?
+    };
+    if !main.join(".git").exists() {
+        bail!(
+            "{} is not colocated (no .git beside .jj) — jjsync requires colocated repos",
+            main.display()
+        );
+    }
+    if cfg.find_repo_mut(&main).is_some() {
+        println!("{} is already registered", main.display());
+    } else {
+        cfg.repos.push(RepoConfig {
+            path: main.display().to_string(),
+            ..Default::default()
+        });
+        println!("registered {}", main.display());
     }
 
     cfg.save(&cfg_path)?;
