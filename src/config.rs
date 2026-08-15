@@ -1,4 +1,8 @@
-//! `~/.config/jjsync/config.json` — the only configuration jjsync has.
+//! `~/.config/jjsync/config.json` plus an optional `config.local.json`.
+//!
+//! The shared file is meant to travel with the user's dotfiles (every machine
+//! sees the same repo list); the local file never leaves the machine — it adds
+//! machine-only repos and can opt out of shared ones via `ignoreRepos`.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,6 +13,10 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub interval_seconds: u64,
     pub repos: Vec<RepoConfig>,
+    /// Repos to drop from the merged list, each entry a path or a directory
+    /// name. Meant for config.local.json: "this machine opts out of X".
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore_repos: Vec<String>,
 }
 
 impl Default for Config {
@@ -16,6 +24,7 @@ impl Default for Config {
         Config {
             interval_seconds: 60,
             repos: vec![],
+            ignore_repos: vec![],
         }
     }
 }
@@ -24,6 +33,9 @@ impl Default for Config {
 #[serde(rename_all = "camelCase", default)]
 pub struct RepoConfig {
     pub path: String,
+    /// Clone source for `jjsync bootstrap`; recorded by `jjsync init`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     pub remote: String,
     pub ref_prefix: String,
     pub leak_scan: bool,
@@ -34,6 +46,7 @@ impl Default for RepoConfig {
     fn default() -> Self {
         RepoConfig {
             path: String::new(),
+            url: None,
             remote: "origin".into(),
             ref_prefix: "refs/jj-sync/".into(),
             leak_scan: true,
@@ -74,11 +87,19 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-pub fn config_path() -> PathBuf {
+fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| expand_tilde("~/.config"));
-    base.join("jjsync/config.json")
+    base.join("jjsync")
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+pub fn local_config_path() -> PathBuf {
+    config_dir().join("config.local.json")
 }
 
 pub fn state_path() -> PathBuf {
@@ -112,6 +133,33 @@ impl Config {
             .iter_mut()
             .find(|r| r.expanded_path() == repo_path)
     }
+
+    /// Shared config.json + this machine's config.local.json.
+    pub fn load_both() -> Result<(Config, Config)> {
+        Ok((
+            Config::load(&config_path())?,
+            Config::load(&local_config_path())?,
+        ))
+    }
+}
+
+/// The repo list this machine acts on: shared repos plus local ones, minus
+/// anything named in either file's `ignoreRepos` (by path or directory name).
+pub fn effective_repos(shared: &Config, local: &Config) -> Vec<RepoConfig> {
+    let ignored = |r: &RepoConfig| {
+        shared
+            .ignore_repos
+            .iter()
+            .chain(&local.ignore_repos)
+            .any(|i| *i == r.name() || expand_tilde(i) == r.expanded_path())
+    };
+    shared
+        .repos
+        .iter()
+        .chain(&local.repos)
+        .filter(|r| !ignored(r))
+        .cloned()
+        .collect()
 }
 
 /// Simple glob match supporting only `*` (any run of characters).

@@ -110,6 +110,7 @@ refuses non-colocated) and hand-editable:
   "repos": [
     {
       "path": "~/dotfiles",
+      "url": "git@github.com:you/dotfiles.git",
       "remote": "origin",
       "refPrefix": "refs/jj-sync/",
       "leakScan": true,
@@ -119,10 +120,20 @@ refuses non-colocated) and hand-editable:
 }
 ```
 
+`config.json` is the shared file: it travels with the user's dotfiles so every
+machine sees the same repo list, and `url` (recorded by `init` from the
+remote) is what `jjsync bootstrap` clones from on a machine where `path` does
+not exist yet. `config.local.json` beside it is machine-only and never synced:
+its `repos` concatenate onto the shared list (`jjsync init --local`), and its
+`ignoreRepos` — entries matching a repo's path or directory name — drops
+shared repos on this machine. A configured repo whose path is absent is a
+non-event during sync (like offline) and shows as "not cloned" in `status`.
+
 ## CLI
 
 ```text
-jjsync init        register cwd repo in the config
+jjsync init        register cwd repo in the config (--local: this machine only)
+jjsync bootstrap   clone configured repos missing on this machine (colocated)
 jjsync sync        run one cycle for all repos (what the timer fires)
 jjsync status      per-repo state; one line per problem, ✓ when healthy
 jjsync resolve     unfreeze a diverged bookmark: local position wins

@@ -3,6 +3,7 @@ name = "jjsync"
 version = "0.1.0"
 edition = "2021"
 description = "Background synchronization for Jujutsu repositories"
+repository = "https://github.com/HectorBjernersjo/jjsync"
 
 [dependencies]
 anyhow = "1"
@@ -12,3 +13,8 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

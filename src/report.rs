@@ -5,7 +5,7 @@ use crate::cycle::RepoOutcome;
 use crate::exec::Env;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -37,33 +37,75 @@ impl Report {
         Ok(())
     }
 
-    /// One line per repo: problems win over ✓, plus the report's age.
-    /// `configured` repos missing from the report show as never synced.
-    pub fn render(&self, configured: &[String], now: u64) -> String {
+    /// One line per repo: problems win over ✓, unpublished local state shows
+    /// as pending, plus the report's age. `configured` repos missing from the
+    /// report show as never synced; `not_cloned` repos (path absent on this
+    /// machine) point at `jjsync bootstrap` instead.
+    pub fn render(
+        &self,
+        configured: &[String],
+        not_cloned: &[String],
+        pending: &BTreeMap<String, Vec<String>>,
+        now: u64,
+    ) -> String {
         let mut out = String::new();
         let age = age_suffix(self.when, now);
         for repo in &self.repos {
-            let state = if !repo.problems.is_empty() {
-                repo.problems
-                    .iter()
-                    .map(|p| match p.bookmark() {
-                        Some(b) => format!("⚠ {b} {}", p.message()),
-                        None => format!("⚠ {}", p.message()),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("; ")
+            if not_cloned.contains(&repo.repo) {
+                continue; // a stale report entry for a since-deleted directory
+            }
+            // Frozen bookmarks differ from S by design and already show as ⚠.
+            let frozen: BTreeSet<String> = repo
+                .problems
+                .iter()
+                .filter_map(|p| p.bookmark().map(|b| format!("bookmark {b}")))
+                .collect();
+            let pend: Vec<String> = pending
+                .get(&repo.repo)
+                .into_iter()
+                .flatten()
+                .filter(|i| !frozen.contains(*i))
+                .cloned()
+                .collect();
+            let mut parts: Vec<String> = vec![];
+            if !repo.problems.is_empty() {
+                parts.push(
+                    repo.problems
+                        .iter()
+                        .map(|p| match p.bookmark() {
+                            Some(b) => format!("⚠ {b} {}", p.message()),
+                            None => format!("⚠ {}", p.message()),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
             } else if repo.offline {
-                "○ offline (will retry)".to_string()
-            } else if repo.synced_workspaces.is_empty() {
-                "✓ synced".to_string()
-            } else {
-                format!("✓ synced ({})", repo.synced_workspaces.join(", "))
-            };
-            out.push_str(&format!("{:<24} {state}{age}\n", repo.repo));
+                parts.push("○ offline (will retry)".to_string());
+            }
+            if !pend.is_empty() {
+                parts.push(format!("● pending: {}", pend.join(", ")));
+            }
+            if parts.is_empty() {
+                parts.push(if repo.synced_workspaces.is_empty() {
+                    "✓ synced".to_string()
+                } else {
+                    format!("✓ synced ({})", repo.synced_workspaces.join(", "))
+                });
+            }
+            out.push_str(&format!("{:<24} {}{age}\n", repo.repo, parts.join("; ")));
         }
         for name in configured {
-            if !self.repos.iter().any(|r| &r.repo == name) {
-                out.push_str(&format!("{name:<24} – never synced\n"));
+            if not_cloned.contains(name) {
+                out.push_str(&format!(
+                    "{name:<24} ○ not cloned — run `jjsync bootstrap`\n"
+                ));
+            } else if !self.repos.iter().any(|r| &r.repo == name) {
+                let pend = pending.get(name).filter(|p| !p.is_empty());
+                let extra = match pend {
+                    Some(p) => format!("; ● pending: {}", p.join(", ")),
+                    None => String::new(),
+                };
+                out.push_str(&format!("{name:<24} – never synced{extra}\n"));
             }
         }
         if out.is_empty() {

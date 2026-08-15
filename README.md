@@ -26,15 +26,22 @@ $ cd ~/dotfiles          # any colocated jj repo with an origin remote
 $ jjsync init            # registers the repo, installs + starts the systemd user timer
 ```
 
-Repeat `jjsync init` on each machine. That's it — the timer runs a sync cycle
-every 60 s (configurable in `~/.config/jjsync/config.json`).
+On the next machine, either repeat `jjsync init` in its clone of each repo, or
+— if `config.json` reaches the machine some other way, e.g. synced with your
+dotfiles — run `jjsync bootstrap` once: it clones every configured repo that
+is missing (colocated, from the recorded `url`) and installs the timer. The
+timer runs a sync cycle every 60 s (configurable in
+`~/.config/jjsync/config.json`).
 
 ## Commands
 
 ```text
 jjsync init        register the cwd repo in the config
+                   (--local: this machine only, in config.local.json)
+jjsync bootstrap   clone configured repos missing on this machine
 jjsync sync        run one cycle for all repos (what the timer fires)
-jjsync status      one line per repo (✓/○/⚠ + last-sync age), plus timer health
+jjsync status      one line per repo (✓/○/⚠, unsynced local state as ● pending,
+                   last-sync age), plus timer health
 jjsync resolve X   unfreeze diverged bookmark X: local position wins
 jjsync pause       stop the timer
 jjsync resume      start the timer
@@ -53,12 +60,29 @@ raise a desktop notification and show in `jjsync status`. Offline is a non-event
   "repos": [
     {
       "path": "/home/you/dotfiles",
+      "url": "git@github.com:you/dotfiles.git",
       "remote": "origin",
       "refPrefix": "refs/jj-sync/",
       "leakScan": true,
       "excludeBookmarks": ["wip/*"]
     }
   ]
+}
+```
+
+`config.json` is meant to be shared across machines (symlink it from your
+dotfiles): every machine acts on the same repo list, and `jjsync bootstrap`
+clones whatever is missing using each repo's `url`. Machine-only state goes in
+`config.local.json` next to it, which is never meant to leave the machine: its
+`repos` are added to the shared list (register with `jjsync init --local` —
+e.g. a work repo that shouldn't appear in personal dotfiles), and its
+`ignoreRepos` (paths or directory names) opts this machine out of shared
+repos:
+
+```json
+{
+  "repos": [{ "path": "/home/you/work-repo", "url": "..." }],
+  "ignoreRepos": ["some-shared-repo"]
 }
 ```
 

@@ -141,6 +141,88 @@ pub fn sync_repo(cfg: &RepoConfig, opts: &CycleOpts) -> RepoOutcome {
     )
 }
 
+/// Local state S doesn't record yet — what `jjsync status` shows as pending.
+/// Snapshots each workspace so plain disk edits count, then compares working
+/// copies, bookmarks, and anonymous heads against S. No network access: this
+/// answers "is everything local published?", not "did the remote move?".
+pub fn pending_items(cfg: &RepoConfig, env: &Env) -> Result<Vec<String>> {
+    let path = cfg.expanded_path();
+    if !path.join(".jj").is_dir() || !path.join(".git").exists() {
+        return Ok(vec![]);
+    }
+    let git = Git::new(&path, env);
+    let jj = Jj::new(&path, env);
+    let s_map = git.refs_with_prefix(S_NS)?;
+    let mut pending: Vec<String> = vec![];
+
+    let mut ws_dirs: Vec<(String, PathBuf)> = vec![];
+    for (name, _) in jj.workspaces()? {
+        if let Some(dir) = jj.workspace_root(&name) {
+            if dir.is_dir() {
+                ws_dirs.push((name, dir));
+            }
+        }
+    }
+    for (_, dir) in &ws_dirs {
+        Jj::new(dir, env).snapshot()?;
+    }
+    let ws_targets: BTreeMap<String, String> = jj.workspaces()?.into_iter().collect();
+
+    for (ws, dir) in &ws_dirs {
+        let Some(l) = ws_targets.get(ws) else {
+            continue;
+        };
+        match s_map.get(ws) {
+            Some(s) if s == l => {}
+            // Never synced: an empty undescribed @ holds nothing to publish.
+            None if Jj::new(dir, env).is_discardable(l).unwrap_or(false) => {}
+            _ => pending.push(format!("@ ({ws})")),
+        }
+    }
+
+    let excluded =
+        |n: &str| is_sync_bookmark(n) || cfg.exclude_bookmarks.iter().any(|p| glob_match(p, n));
+    let local_bm: BTreeMap<String, String> = git
+        .refs_with_prefix("refs/heads/")?
+        .into_iter()
+        .filter(|(n, _)| !excluded(n))
+        .collect();
+    let s_bm: BTreeMap<String, String> = s_map
+        .iter()
+        .filter_map(|(k, v)| {
+            k.strip_prefix("bookmarks/")
+                .map(|n| (n.to_string(), v.clone()))
+        })
+        .filter(|(n, _)| !excluded(n))
+        .collect();
+    let mut names: BTreeSet<&String> = BTreeSet::new();
+    names.extend(local_bm.keys());
+    names.extend(s_bm.keys());
+    for name in names {
+        if local_bm.get(name) != s_bm.get(name) {
+            pending.push(format!("bookmark {name}"));
+        }
+    }
+
+    let ws_shas: BTreeSet<String> = ws_targets.into_values().collect();
+    let local_heads: BTreeSet<String> = jj
+        .log_shas("heads(all()) ~ bookmarks() ~ remote_bookmarks() ~ root()")?
+        .into_iter()
+        .filter(|s| !ws_shas.contains(s))
+        .collect();
+    let s_heads: BTreeSet<String> = s_map
+        .keys()
+        .filter_map(|k| k.strip_prefix("heads/").map(String::from))
+        .collect();
+    // New here (unpublished) plus gone here (deletion unpublished).
+    match local_heads.symmetric_difference(&s_heads).count() {
+        0 => {}
+        1 => pending.push("1 head".into()),
+        n => pending.push(format!("{n} heads")),
+    }
+    Ok(pending)
+}
+
 /// Imports fetched commits into jj's view via short-lived local branches.
 /// Cleanup deletes the temp bookmarks through jj, which keeps the commits
 /// visible (deleting the git ref directly would abandon them on re-import).
@@ -694,8 +776,7 @@ fn repair_rewrites(
         for (cid, chg) in jj.visible_commits()? {
             by_change.entry(chg).or_default().push(cid);
         }
-        let ws_targets: BTreeSet<String> =
-            jj.workspaces()?.into_iter().map(|(_, t)| t).collect();
+        let ws_targets: BTreeSet<String> = jj.workspaces()?.into_iter().map(|(_, t)| t).collect();
         let local_refs: BTreeSet<String> =
             git.refs_with_prefix("refs/heads/")?.into_values().collect();
         let mut acted = false;
@@ -706,8 +787,9 @@ fn repair_rewrites(
                 (false, true) => (b, a),
                 _ => continue,
             };
-            let in_reconcile =
-                |sha: &str| -> Result<bool> { Ok(git.is_ancestor(sha, l)? || git.is_ancestor(sha, r)?) };
+            let in_reconcile = |sha: &str| -> Result<bool> {
+                Ok(git.is_ancestor(sha, l)? || git.is_ancestor(sha, r)?)
+            };
             if !in_reconcile(stale)?
                 || !in_reconcile(new)?
                 || ws_targets.contains(stale.as_str())
@@ -738,15 +820,9 @@ fn repair_rewrites(
 /// independently changed. A hidden `start` (jj auto-abandons an empty
 /// undescribed @ on leave) still has its parents walked. Returns every
 /// commit abandoned.
-fn abandon_exposed(
-    git: &Git,
-    jj: &Jj,
-    start: &str,
-    remote_pins: &[String],
-) -> Result<Vec<String>> {
+fn abandon_exposed(git: &Git, jj: &Jj, start: &str, remote_pins: &[String]) -> Result<Vec<String>> {
     let ws_now: BTreeSet<String> = jj.workspaces()?.into_iter().map(|(_, t)| t).collect();
-    let local_refs: BTreeSet<String> =
-        git.refs_with_prefix("refs/heads/")?.into_values().collect();
+    let local_refs: BTreeSet<String> = git.refs_with_prefix("refs/heads/")?.into_values().collect();
     let root = jj.log_shas("root()")?;
     let pinned = |sha: &str| -> Result<bool> {
         for pin in remote_pins {

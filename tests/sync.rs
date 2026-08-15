@@ -177,6 +177,10 @@ impl Machine {
         );
         out
     }
+
+    fn pending(&self) -> Vec<String> {
+        jjsync::cycle::pending_items(&self.cfg, &self.env).unwrap()
+    }
 }
 
 /// Edit on A → sync A → sync B → same content *and same change-id* on B.
@@ -528,7 +532,10 @@ fn abandoned_chain_is_not_resurrected() {
     assert!(!a.dir.join("work.txt").exists());
     for m in [&a, &b] {
         assert!(!m.is_visible(&tip), "the old @ must stay abandoned");
-        assert!(!m.is_visible(&work), "the described ancestor must stay abandoned");
+        assert!(
+            !m.is_visible(&work),
+            "the described ancestor must stay abandoned"
+        );
     }
     assert!(
         w.remote_ref("refs/jj-sync/heads").is_none(),
@@ -590,7 +597,10 @@ fn divergent_heads_abandoned_together_stay_abandoned() {
         for t in &twins {
             assert!(!m.is_visible(t), "twin {t} must stay abandoned");
         }
-        assert!(!m.is_visible(&base), "the exposed parent must stay abandoned");
+        assert!(
+            !m.is_visible(&base),
+            "the exposed parent must stay abandoned"
+        );
     }
     assert!(
         w.remote_ref("refs/jj-sync/heads").is_none(),
@@ -717,6 +727,21 @@ fn bookmarks_move_freeze_resolve() {
         .any(|p| matches!(p, Problem::FrozenBookmark { .. })));
     assert_eq!(b.template("feat", "commit_id"), b_pos);
 
+    // The frozen bookmark differs from S by design, so it counts as pending —
+    // but status renders it as ⚠ and must not repeat it in the pending list.
+    assert!(b.pending().contains(&"bookmark feat".to_string()));
+    let pending: std::collections::BTreeMap<String, Vec<String>> =
+        [("machine-b".to_string(), b.pending())]
+            .into_iter()
+            .collect();
+    let rendered = jjsync::report::Report {
+        when: 0,
+        repos: vec![still.clone()],
+    }
+    .render(&[], &[], &pending, 0);
+    assert!(rendered.contains("⚠ feat"), "rendered: {rendered}");
+    assert!(!rendered.contains("bookmark feat"), "rendered: {rendered}");
+
     // Explicit resolve: B's local position wins and propagates to A.
     let resolved = b.sync_with(CycleOpts {
         env: b.env.clone(),
@@ -794,6 +819,51 @@ fn multi_workspace_independent_and_skipped() {
     assert_eq!(a.wc_sha(), default_sha, "default workspace must not move");
 }
 
+/// Everything local that S doesn't record shows as pending — plain disk
+/// edits, bookmark creates/moves/deletes, parked anonymous heads — and a
+/// fully synced repo shows nothing.
+#[test]
+fn pending_reflects_unsynced_local_state() {
+    let w = World::new();
+    let a = w.machine("machine-a");
+
+    // Fresh repo: the empty undescribed @ holds nothing to publish.
+    assert!(a.pending().is_empty(), "got {:?}", a.pending());
+
+    // A plain disk edit counts (the check snapshots), and syncing clears it.
+    a.write("f.txt", "one\n");
+    assert_eq!(a.pending(), vec!["@ (default)"]);
+    a.sync_ok();
+    assert!(a.pending().is_empty(), "got {:?}", a.pending());
+
+    // Bookmark created (and @ rewritten by describe/new).
+    a.jj(&["describe", "-m", "base"]);
+    a.jj(&["new"]);
+    a.jj(&["bookmark", "create", "feat", "-r", "@-"]);
+    let p = a.pending();
+    assert!(p.contains(&"@ (default)".to_string()), "got {p:?}");
+    assert!(p.contains(&"bookmark feat".to_string()), "got {p:?}");
+    a.sync_ok();
+    assert!(a.pending().is_empty(), "got {:?}", a.pending());
+
+    // A bookmark deletion is itself an unsynced change.
+    a.jj(&["bookmark", "delete", "feat"]);
+    assert_eq!(a.pending(), vec!["bookmark feat"]);
+    a.sync_ok();
+    assert!(a.pending().is_empty(), "got {:?}", a.pending());
+
+    // Parking work: the old @ becomes an unpublished anonymous head and the
+    // fresh @ is an unpublished working-copy move.
+    a.write("park.txt", "parked\n");
+    a.sync_ok();
+    a.jj(&["new", "root()"]);
+    let p = a.pending();
+    assert!(p.contains(&"@ (default)".to_string()), "got {p:?}");
+    assert!(p.contains(&"1 head".to_string()), "got {p:?}");
+    a.sync_ok();
+    assert!(a.pending().is_empty(), "got {:?}", a.pending());
+}
+
 /// Excluded bookmarks never leave the machine; offline is a silent non-event.
 #[test]
 fn excluded_bookmarks_and_offline() {
@@ -807,6 +877,8 @@ fn excluded_bookmarks_and_offline() {
     a.sync_ok();
     assert!(w.remote_ref("refs/jj-sync/bookmarks/keep").is_some());
     assert!(w.remote_ref("refs/jj-sync/bookmarks/wip/scratch").is_none());
+    // The unsynced-but-excluded bookmark must not show as pending either.
+    assert!(a.pending().is_empty(), "got {:?}", a.pending());
 
     // Unreachable remote: no problems raised, nothing local changes.
     let wc = a.wc_sha();
@@ -825,6 +897,181 @@ fn excluded_bookmarks_and_offline() {
         out.problems
     );
     assert_eq!(a.wc_sha(), wc);
+}
+
+/// The machine-fleet story end to end: `init` records the clone URL in the
+/// shared config, `init --local` keeps a work repo out of it, a fresh machine
+/// bootstraps colocated clones from the shared config alone, and `ignoreRepos`
+/// in the local config opts a machine out of a shared repo.
+#[test]
+fn cli_local_config_bootstrap_and_ignore() {
+    let w = World::new();
+    let a = w.machine("machine-a");
+    a.write("shared.txt", "shared content\n");
+
+    // A second repo with its own remote — the work repo that must never
+    // enter the shared (dotfiles-synced) config.
+    let work_remote = w.root.join("work-remote.git");
+    run_ok(
+        "git",
+        &["init", "-q", "--bare", work_remote.to_str().unwrap()],
+        &w.root,
+        &w.env,
+    )
+    .unwrap();
+    let work = w.root.join("machine-a-work");
+    fs::create_dir_all(&work).unwrap();
+    run_ok("git", &["init", "-q"], &work, &w.env).unwrap();
+    run_ok(
+        "git",
+        &["remote", "add", "origin", work_remote.to_str().unwrap()],
+        &work,
+        &w.env,
+    )
+    .unwrap();
+    run_ok("jj", &["git", "init", "--colocate"], &work, &w.env).unwrap();
+    fs::write(work.join("work.txt"), "work content\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_jjsync");
+    let run_cli = |args: &[&str], cwd: &Path, env: &Env| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args).current_dir(cwd);
+        for (k, v) in &env.vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "jjsync {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    run_cli(&["init"], &a.dir, &w.env);
+    assert!(run_cli(&["init", "--local"], &work, &w.env).contains("this machine only"));
+
+    let cfg_dir = w.root.join("home/.config/jjsync");
+    let shared_text = fs::read_to_string(cfg_dir.join("config.json")).unwrap();
+    let local_text = fs::read_to_string(cfg_dir.join("config.local.json")).unwrap();
+    assert!(shared_text.contains(&a.dir.display().to_string()));
+    assert!(
+        shared_text.contains(&w.remote.display().to_string()),
+        "init must record the clone url: {shared_text}"
+    );
+    assert!(
+        !shared_text.contains("machine-a-work"),
+        "--local must keep the work repo out of the shared config"
+    );
+    assert!(local_text.contains("machine-a-work"));
+    assert!(local_text.contains(&work_remote.display().to_string()));
+
+    // One sync covers both config files.
+    run_cli(&["sync"], &w.root, &w.env);
+    assert!(w.remote_ref("refs/jj-sync/default").is_some());
+    let out = run_ok(
+        "git",
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/jj-sync/default",
+        ],
+        &work_remote,
+        &w.env,
+    )
+    .unwrap();
+    assert!(
+        !out.stdout.trim().is_empty(),
+        "the local-config repo must sync too"
+    );
+
+    // "Machine B": a fresh home whose dotfiles delivered only the shared
+    // config, with paths under this machine's own directory.
+    let home2 = w.root.join("home2");
+    fs::create_dir_all(home2.join(".config/jjsync")).unwrap();
+    fs::create_dir_all(home2.join(".config/jj")).unwrap();
+    fs::write(
+        home2.join(".gitconfig"),
+        "[user]\n\tname = Test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n",
+    )
+    .unwrap();
+    fs::write(
+        home2.join(".config/jj/config.toml"),
+        "user.name = \"Test\"\nuser.email = \"test@example.com\"\n",
+    )
+    .unwrap();
+    let env2 = Env {
+        vars: vec![
+            ("HOME".into(), home2.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                home2.join(".config").display().to_string(),
+            ),
+            (
+                "XDG_STATE_HOME".into(),
+                home2.join(".state").display().to_string(),
+            ),
+            (
+                "XDG_CACHE_HOME".into(),
+                home2.join(".cache").display().to_string(),
+            ),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+            ("JJSYNC_NO_NOTIFY".into(), "1".into()),
+            ("JJSYNC_NO_SYSTEMD".into(), "1".into()),
+        ],
+    };
+    fs::write(
+        home2.join(".config/jjsync/config.json"),
+        shared_text.replace("machine-a", "machine-b"),
+    )
+    .unwrap();
+
+    let st = run_cli(&["status"], &w.root, &env2);
+    assert!(st.contains("○ not cloned"), "status was: {st}");
+
+    run_cli(&["bootstrap"], &w.root, &env2);
+    let b_dir = w.root.join("machine-b");
+    assert!(
+        b_dir.join(".jj").is_dir() && b_dir.join(".git").exists(),
+        "bootstrap must produce a colocated clone"
+    );
+
+    run_cli(&["sync"], &w.root, &env2);
+    assert_eq!(
+        fs::read_to_string(b_dir.join("shared.txt")).unwrap(),
+        "shared content\n"
+    );
+    let b_change = run_ok(
+        "jj",
+        &["log", "--no-graph", "-r", "@", "-T", "change_id"],
+        &b_dir,
+        &env2,
+    )
+    .unwrap()
+    .stdout;
+    assert_eq!(
+        a.wc_change(),
+        b_change.trim(),
+        "the bootstrapped clone must join the shared working-copy change"
+    );
+
+    // And it is a full citizen: an edit on B reaches A.
+    fs::write(b_dir.join("from-b.txt"), "hello from b\n").unwrap();
+    run_cli(&["sync"], &w.root, &env2);
+    a.sync_ok();
+    assert_eq!(a.read("from-b.txt"), "hello from b\n");
+
+    // ignoreRepos in the local config opts this machine out of a shared repo.
+    fs::write(
+        home2.join(".config/jjsync/config.local.json"),
+        "{ \"ignoreRepos\": [\"machine-b\"] }\n",
+    )
+    .unwrap();
+    let st = run_cli(&["status"], &w.root, &env2);
+    assert!(
+        st.contains("no repos configured"),
+        "the ignored repo must vanish from status: {st}"
+    );
 }
 
 /// The CLI end to end: init registers the repo, sync publishes, status reports.
@@ -853,6 +1100,17 @@ fn cli_init_sync_status() {
     assert!(run_cli(&["init"], &a.dir).contains("registered"));
     run_cli(&["sync"], &a.dir);
     assert!(w.remote_ref("refs/jj-sync/default").is_some());
+    let status = run_cli(&["status"], &a.dir);
+    assert!(status.contains("✓ synced"), "status was: {status}");
+
+    // An edit after the sync shows as pending until the next cycle.
+    a.write("f.txt", "edited after sync\n");
+    let status = run_cli(&["status"], &a.dir);
+    assert!(
+        status.contains("● pending: @ (default)"),
+        "status was: {status}"
+    );
+    run_cli(&["sync"], &a.dir);
     let status = run_cli(&["status"], &a.dir);
     assert!(status.contains("✓ synced"), "status was: {status}");
 }
