@@ -48,3 +48,24 @@ divergent and merges per ADR 0002.
 - The stale-copy orientation relies on S, so a machine with lost S (fresh
   clone, interrupted cycle) degrades to the old merge behavior for one cycle
   rather than guessing wrong.
+
+## Addendum (2026-08-28): stale copies outside the workspace reconcile
+
+The same shape appears outside the fork branch. When B adopts A's rewritten
+@ or moves a bookmark to A's rewritten child, B's old copy can survive the
+cleanup (its old child still hangs on it) and then stand exposed one step
+later as a childless anonymous head. The heads phase used to read that as
+"created here" and publish it, handing A its own predecessor back as a
+divergent twin; every further rewrite on A repeated it (observed: one change
+with five visible copies).
+
+The heads phase now applies this ADR's orientation to every divergent change
+before publishing: a copy reachable from S with a sibling S cannot reach is
+the predecessor, and where it stands exposed it is abandoned (with the usual
+cascade to what it exposes) instead of published. Copies the remote still
+reaches are pinned and stay, so a divergence the other machine keeps is not
+resolved behind its back. The "deletion meets edit" guard for heads deleted
+on the other machine counts only siblings S cannot reach as an edit: a
+sibling both machines already synced is a divergent twin the other machine
+kept, so abandoning one copy of a synced pair now propagates instead of
+bouncing back.

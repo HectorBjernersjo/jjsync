@@ -487,44 +487,69 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
         );
         // Adopt heads created on other machines.
         let mut importer = Importer::new(&git, &jj);
-        let mut adopted: Vec<String> = vec![];
         for sha in r_heads.keys() {
             // In S means "we already synced this" — its absence locally is a
             // local abandon/supersede, not something to re-adopt.
             if !h_before.contains(sha) && !s_heads.contains_key(sha) && !jj.is_visible(sha) {
                 importer.ensure_visible(sha)?;
-                adopted.push(sha.clone());
             }
         }
         importer.cleanup()?;
-        // A stale local twin of an adopted head (same change, byte-identical
-        // to last-synced, superseded remotely) is replaced, not kept — the
-        // same rule as the working-copy adopt. Genuine concurrent edits keep
-        // both versions (divergent change).
-        if !adopted.is_empty() {
-            let chg: BTreeMap<String, String> = jj.visible_commits()?.into_iter().collect();
-            for sha in &adopted {
-                let Some(c) = chg.get(sha) else { continue };
-                for y in &h_before {
-                    if y != sha
-                        && chg.get(y) == Some(c)
-                        && s_heads.contains_key(y)
-                        && !r_heads.contains_key(y)
-                        && !jj.has_children(y)?
-                    {
-                        jj.abandon(y)?;
-                    }
+
+        // Reachable from the last-synced state: both machines agreed on it.
+        let s_values: Vec<String> = s_map.values().cloned().collect();
+        let reachable_from_s = |sha: &str| -> Result<bool> {
+            for v in &s_values {
+                if git.is_ancestor(sha, v)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        // Stale copies. A change with one copy both machines agreed on
+        // (reachable from S) and one that arrived since is a rewrite jj could
+        // not propagate here (ADR 0004): the agreed-on copy is the
+        // predecessor. Where it stands exposed — no children, not a working
+        // copy, not bookmarked, nothing on the remote reaches it — abandon it
+        // together with whatever that exposes. Left visible it would be
+        // published as "created here" next, handing the rewriting machine its
+        // own predecessor back as a divergent twin. This is how the adopt of a
+        // rewritten @ or a moved bookmark leaves its old child/parent behind;
+        // it also replaces the stale twin of an adopted head. Copies the
+        // remote still reaches (a divergence the other machine keeps) are
+        // pinned inside abandon_exposed and stay.
+        let mut by_change: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (sha, chg) in jj.divergent_commits()? {
+            by_change.entry(chg).or_default().push(sha);
+        }
+        for shas in by_change.values() {
+            let mut stale = vec![];
+            let mut fresh = false;
+            for sha in shas {
+                if reachable_from_s(sha)? {
+                    stale.push(sha);
+                } else {
+                    fresh = true;
+                }
+            }
+            if fresh {
+                for sha in stale {
+                    abandon_exposed(&git, &jj, sha, &remote_pins)?;
                 }
             }
         }
 
         let mut h = heads_of(&jj)?;
         // Deleted there: abandon locally only if untouched (still a visible
-        // head, no divergent sibling keeping the change alive). A sibling
-        // itself slated for deletion does not count — divergent twins deleted
-        // together must not deadlock each other alive. The abandon cascades
-        // to exposed parents, or they would resurface as "new" heads next
-        // cycle and bounce the chain back to the deleting machine.
+        // head, no local edit of the change keeping it alive). A local edit
+        // is a visible sibling S cannot reach; a sibling both machines already
+        // synced is a divergent twin the other machine kept, not an edit here.
+        // A sibling itself slated for deletion does not count either —
+        // divergent twins deleted together must not deadlock each other
+        // alive. The abandon cascades to exposed parents, or they would
+        // resurface as "new" heads next cycle and bounce the chain back to
+        // the deleting machine.
         let deleted_there: BTreeSet<String> = h
             .iter()
             .filter(|sha| s_heads.contains_key(*sha) && !r_heads.contains_key(*sha))
@@ -534,9 +559,14 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
             let chg: BTreeMap<String, String> = jj.visible_commits()?.into_iter().collect();
             for sha in &deleted_there {
                 let Some(c) = chg.get(sha) else { continue };
-                let live_sibling = chg
-                    .iter()
-                    .any(|(s2, c2)| c2 == c && s2 != sha && !deleted_there.contains(s2));
+                let mut live_sibling = false;
+                for (s2, c2) in &chg {
+                    if c2 == c && s2 != sha && !deleted_there.contains(s2) && !reachable_from_s(s2)?
+                    {
+                        live_sibling = true;
+                        break;
+                    }
+                }
                 if !live_sibling && !jj.has_children(sha)? {
                     for gone in abandon_exposed(&git, &jj, sha, &remote_pins)? {
                         h.remove(&gone);

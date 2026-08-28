@@ -675,6 +675,177 @@ fn rewrite_propagates_as_rebase_not_merge() {
     );
 }
 
+/// Visible commit ids of a change, sorted.
+fn copies_of(m: &Machine, change: &str) -> Vec<String> {
+    let mut v: Vec<String> = m
+        .jj(&[
+            "log",
+            "--no-graph",
+            "-r",
+            &format!("change_id({change})"),
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    v.sort();
+    v
+}
+
+/// The flow that left one change with five divergent copies in practice.
+/// A's @ carries an empty described child (parked head). A splits @ with
+/// `jj commit <paths>`, which rewrites @'s change and rebases the child. B
+/// adopts: its stale @ copy survives the working-copy cleanup because the
+/// old child still hangs on it; when the child's stale twin is then replaced
+/// by the adopted rewrite, the parent stands exposed as a childless head and
+/// used to be published as "created here" — handing A its own predecessor
+/// back as a divergent twin. Every further rewrite on A repeated it.
+#[test]
+fn stale_predecessor_exposed_on_adopt_is_not_republished() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+
+    a.write("skill.md", "translated\n");
+    a.write("media.md", "record\n");
+    a.jj(&["describe", "-m", "translate"]);
+    a.jj(&["new", "-m", "leftover"]);
+    a.jj(&["edit", "@-"]);
+    a.sync_ok();
+    b.sync_ok();
+    let change = a.wc_change();
+    let stale = a.wc_sha();
+    assert_eq!(b.wc_sha(), stale);
+
+    // Rewrite 1: split @. Then rewrite the committed part twice more, the way
+    // two follow-up squashes did in practice.
+    a.jj(&["commit", "-m", "pr-media", "media.md"]);
+    a.sync_ok();
+    b.sync_ok();
+    a.sync_ok();
+    for round in 1..=2 {
+        a.write("media.md", &format!("record v{round}\n"));
+        a.jj(&["squash", "--into", "@-", "--use-destination-message"]);
+        a.sync_ok();
+        b.sync_ok();
+        a.sync_ok();
+        b.sync_ok();
+    }
+
+    for m in [&a, &b] {
+        assert!(!m.is_visible(&stale), "the pre-split @ must stay hidden");
+        assert_eq!(
+            copies_of(m, &change).len(),
+            1,
+            "the rewritten change must have exactly one visible copy"
+        );
+    }
+    assert_eq!(a.wc_sha(), b.wc_sha());
+    assert_eq!(copies_of(&a, &change), copies_of(&b, &change));
+    assert!(
+        w.remote_ref(&format!("refs/jj-sync/heads/{stale}"))
+            .is_none(),
+        "the stale copy must never be published as a head"
+    );
+}
+
+/// Same exposure through a bookmark: A's @ has a bookmarked child. A amends
+/// @ (child and bookmark follow). B adopts @ and moves the bookmark to the
+/// rebased child, leaving the old child as an unbookmarked, childless head —
+/// which must be dropped, not published as a new head.
+#[test]
+fn stale_copy_exposed_by_bookmark_move_is_not_republished() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+
+    a.write("base.txt", "base\n");
+    a.jj(&["describe", "-m", "base"]);
+    a.jj(&["new", "-m", "feature"]);
+    a.write("feat.txt", "feat\n");
+    a.jj(&["bookmark", "create", "feat", "-r", "@"]);
+    a.jj(&["edit", "@-"]);
+    a.sync_ok();
+    b.sync_ok();
+    let base_change = a.wc_change();
+    let feat_change = a.template("feat", "change_id");
+    let old_feat = a.template("feat", "commit_id");
+
+    a.write("base.txt", "base v2\n");
+    a.sync_ok();
+    b.sync_ok();
+    a.sync_ok();
+    b.sync_ok();
+
+    for m in [&a, &b] {
+        assert!(
+            !m.is_visible(&old_feat),
+            "the old bookmark target must stay hidden"
+        );
+        assert_eq!(copies_of(m, &base_change).len(), 1);
+        assert_eq!(copies_of(m, &feat_change).len(), 1);
+        assert_eq!(m.template("feat", "description").trim(), "feature");
+    }
+    assert_eq!(a.wc_sha(), b.wc_sha());
+    assert!(
+        w.remote_ref("refs/jj-sync/heads").is_none(),
+        "no anonymous head may be published for the bookmark's old target"
+    );
+}
+
+/// Abandoning one copy of a divergent pair (both already synced) must
+/// propagate. The other machine's "deletion meets edit" guard used to treat
+/// the surviving twin as a local edit and republish the deleted copy — so a
+/// user cleaning up divergence saw it bounce straight back.
+#[test]
+fn abandoning_a_synced_divergent_copy_propagates() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+
+    a.write("park.txt", "parked\n");
+    a.jj(&["describe", "-m", "parked"]);
+    let parked_change = a.wc_change();
+    a.jj(&["new", "root()"]);
+    a.sync_ok();
+    b.sync_ok();
+
+    a.jj(&["describe", "-m", "from a", &parked_change]);
+    b.jj(&["describe", "-m", "from b", &parked_change]);
+    a.sync_ok();
+    b.sync_ok();
+    a.sync_ok();
+    let twins = copies_of(&a, &parked_change);
+    assert_eq!(twins.len(), 2, "expected a divergent pair, got {twins:?}");
+    assert_eq!(copies_of(&b, &parked_change), twins);
+
+    // A picks a winner by abandoning the copy that came from B.
+    let from_b = twins
+        .iter()
+        .find(|t| a.template(t, "description").trim() == "from b")
+        .unwrap()
+        .clone();
+    let from_a = twins.iter().find(|t| **t != from_b).unwrap().clone();
+    a.jj(&["abandon", &from_b]);
+    a.sync_ok();
+    b.sync_ok();
+    a.sync_ok();
+
+    for m in [&a, &b] {
+        assert!(
+            !m.is_visible(&from_b),
+            "the abandoned copy must stay abandoned"
+        );
+        assert!(
+            m.is_visible(&from_a),
+            "the surviving copy must stay visible"
+        );
+        assert_eq!(copies_of(m, &parked_change), vec![from_a.clone()]);
+    }
+    assert!(w
+        .remote_ref(&format!("refs/jj-sync/heads/{from_b}"))
+        .is_none());
+}
+
 /// M2: bookmark moves mirror across machines; moving differently on both
 /// freezes the bookmark until `resolve` (local wins), which then propagates.
 #[test]

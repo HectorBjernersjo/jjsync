@@ -128,6 +128,29 @@ impl<'a> Jj<'a> {
             .collect())
     }
 
+    /// (commit id, change id) of every visible commit whose change has more
+    /// than one visible commit. Filtered in the template so the output stays
+    /// small on large repos.
+    pub fn divergent_commits(&self) -> Result<Vec<(String, String)>> {
+        let out = self.jj_ok(&[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            "all()",
+            "-T",
+            r#"if(divergent, commit_id ++ " " ++ change_id ++ "\n", "")"#,
+        ])?;
+        Ok(out
+            .stdout
+            .lines()
+            .filter_map(|l| {
+                l.split_once(' ')
+                    .map(|(c, ch)| (c.to_string(), ch.trim().to_string()))
+            })
+            .collect())
+    }
+
     /// Is this commit id known to jj and visible? Naming a hidden commit by
     /// id makes it resolve in revsets (even through `& all()`), so hiddenness
     /// must be read from the commit itself.
