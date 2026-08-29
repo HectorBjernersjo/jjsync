@@ -1,7 +1,7 @@
 //! The status report `jjsync sync` writes and `jjsync status` reads, plus
 //! desktop notifications for newly appeared problems.
 
-use crate::cycle::RepoOutcome;
+use crate::cycle::{Problem, RepoOutcome};
 use crate::exec::Env;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -49,8 +49,17 @@ impl Report {
         now: u64,
     ) -> String {
         let mut out = String::new();
-        let age = age_suffix(self.when, now);
         for repo in &self.repos {
+            // A skipped repo keeps the outcome of the cycle that last ran it,
+            // so its age is its own, not this report's.
+            let age = age_suffix(
+                if repo.synced_at > 0 {
+                    repo.synced_at
+                } else {
+                    self.when
+                },
+                now,
+            );
             if not_cloned.contains(&repo.repo) {
                 continue; // a stale report entry for a since-deleted directory
             }
@@ -81,6 +90,8 @@ impl Report {
                 );
             } else if repo.offline {
                 parts.push("○ offline (will retry)".to_string());
+            } else if repo.auth_retrying {
+                parts.push("○ auth failed once (retrying)".to_string());
             }
             if !pend.is_empty() {
                 parts.push(format!("● pending: {}", pend.join(", ")));
@@ -114,12 +125,37 @@ impl Report {
         out
     }
 
+    /// A lone auth failure is usually the remote throttling us, not a broken
+    /// key: GitHub answers a rate-limited SSH handshake with "Permission
+    /// denied (publickey)", and the next cycle goes through. Hold the first
+    /// one back as a quiet retry; escalate only when it fails again.
+    pub fn debounce_auth(&mut self, prev: Option<&Report>) {
+        for repo in &mut self.repos {
+            if !repo.problems.iter().any(is_auth) {
+                continue;
+            }
+            let failed_last_cycle = prev
+                .iter()
+                .flat_map(|r| &r.repos)
+                .find(|r| r.repo == repo.repo)
+                .is_some_and(|r| r.auth_retrying || r.problems.iter().any(is_auth));
+            if !failed_last_cycle {
+                repo.problems.retain(|p| !is_auth(p));
+                repo.auth_retrying = true;
+            }
+        }
+    }
+
     fn problem_keys(&self) -> BTreeSet<String> {
         self.repos
             .iter()
             .flat_map(|r| r.problems.iter().map(|p| format!("{}:{}", r.repo, p.key())))
             .collect()
     }
+}
+
+fn is_auth(p: &Problem) -> bool {
+    matches!(p, Problem::Auth { .. })
 }
 
 fn age_suffix(when: u64, now: u64) -> String {

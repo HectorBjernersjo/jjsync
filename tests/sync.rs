@@ -1285,3 +1285,144 @@ fn cli_init_sync_status() {
     let status = run_cli(&["status"], &a.dir);
     assert!(status.contains("✓ synced"), "status was: {status}");
 }
+
+/// A lone auth failure is the remote throttling us, not a broken key: the
+/// first one stays quiet and only a repeat in the next cycle escalates.
+#[test]
+fn auth_failure_escalates_only_when_it_repeats() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let w = World::new();
+    let mut a = w.machine("machine-a");
+    a.write("f.txt", "content\n");
+    a.sync_ok();
+
+    // An ssh that denies every connection, the way a rate-limited GitHub does.
+    let ssh = w.root.join("deny-ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\necho 'git@github.com: Permission denied (publickey).' >&2\nexit 255\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    a.cfg.remote = "denied".into();
+    a.git(&["remote", "add", "denied", "ssh://git@example.invalid/r.git"]);
+    let mut env = a.env.clone();
+    env.vars
+        .push(("GIT_SSH_COMMAND".into(), ssh.display().to_string()));
+
+    let denied = |env: &Env| {
+        a.sync_with(CycleOpts {
+            env: env.clone(),
+            ..Default::default()
+        })
+    };
+    let first = denied(&env);
+    assert!(
+        first.problems.iter().any(is_auth),
+        "the wire error must classify as auth: {:?}",
+        first.problems
+    );
+
+    // First strike: held back, silent in status apart from the retry marker.
+    let empty = std::collections::BTreeMap::new();
+    let mut report = jjsync::report::Report {
+        when: 0,
+        repos: vec![first],
+    };
+    report.debounce_auth(None);
+    assert!(
+        !report.repos[0].problems.iter().any(is_auth),
+        "a single auth failure must not surface as a problem"
+    );
+    let rendered = report.render(&[], &[], &empty, 0);
+    assert!(rendered.contains("retrying"), "rendered: {rendered}");
+    assert!(!rendered.contains('⚠'), "rendered: {rendered}");
+
+    // Same failure the next cycle: now it is real, and it is loud.
+    let mut next = jjsync::report::Report {
+        when: 0,
+        repos: vec![denied(&env)],
+    };
+    next.debounce_auth(Some(&report));
+    assert!(
+        next.repos[0].problems.iter().any(is_auth),
+        "a repeated auth failure must escalate"
+    );
+    let rendered = next.render(&[], &[], &empty, 0);
+    assert!(rendered.contains("⚠ auth error"), "rendered: {rendered}");
+
+    // And once the remote lets us in again, the repo goes back to healthy.
+    a.cfg.remote = "origin".into();
+    a.sync_ok();
+}
+
+fn is_auth(p: &Problem) -> bool {
+    matches!(p, Problem::Auth { .. })
+}
+
+/// A repo nobody has touched in a week drops to the slow lane: the timer skips
+/// it until the idle interval is up, and syncs it normally once it does.
+#[test]
+fn dormant_repos_sync_on_the_slow_lane() {
+    let w = World::new();
+    let (a, b) = (w.machine("machine-a"), w.machine("machine-b"));
+    a.write("shared.txt", "from a\n");
+
+    let bin = env!("CARGO_BIN_EXE_jjsync");
+    let cli = |args: &[&str], cwd: &Path| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args).current_dir(cwd);
+        for (k, v) in &w.env.vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "jjsync {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let cfg_path = w.root.join("home/.config/jjsync/config.json");
+    let set = |key: &str, from: &str, to: &str| {
+        let text = fs::read_to_string(&cfg_path).unwrap();
+        let (old, new) = (format!("\"{key}\": {from}"), format!("\"{key}\": {to}"));
+        assert!(text.contains(&old), "config has no {key}: {text}");
+        fs::write(&cfg_path, text.replace(&old, &new)).unwrap();
+    };
+
+    cli(&["init"], &a.dir);
+    cli(&["sync"], &a.dir);
+    b.sync_ok();
+
+    // B publishes something new while A has been idle for over a week
+    // (idleAfterSeconds 0: every repo counts as dormant).
+    b.write("from-b.txt", "from b\n");
+    b.sync_ok();
+    set("idleAfterSeconds", "604800", "0");
+    cli(&["sync"], &a.dir);
+    assert!(
+        !a.dir.join("from-b.txt").exists(),
+        "a dormant repo must not fetch on every tick"
+    );
+    // ...and its status line still shows the cycle that actually ran it.
+    assert!(cli(&["status"], &a.dir).contains("✓ synced"));
+
+    // The quarter hour comes around (idleIntervalSeconds 0 stands in for it).
+    set("idleIntervalSeconds", "900", "0");
+    cli(&["sync"], &a.dir);
+    assert_eq!(
+        a.read("from-b.txt"),
+        "from b\n",
+        "the slow lane must still sync"
+    );
+
+    // Back to a week: A has just worked, so it is on every tick again.
+    set("idleAfterSeconds", "0", "604800");
+    set("idleIntervalSeconds", "0", "900");
+    b.write("again.txt", "b again\n");
+    b.sync_ok();
+    cli(&["sync"], &a.dir);
+    assert_eq!(a.read("again.txt"), "b again\n", "an active repo syncs now");
+}

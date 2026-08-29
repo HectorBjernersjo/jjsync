@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use jjsync::config::{self, Config, RepoConfig};
-use jjsync::cycle::{sync_repo, CycleOpts};
+use jjsync::cycle::{sync_repo, Cadence, CycleOpts, RepoOutcome};
 use jjsync::exec::{run, Env};
 use jjsync::report::{self, notify_new_problems, Report};
 use std::path::Path;
@@ -56,21 +56,48 @@ fn sync(resolve: Vec<String>) -> Result<()> {
     if repos.is_empty() {
         bail!("no repos configured — run `jjsync init` inside a repo first");
     }
+    let resolving = !resolve.is_empty();
     let opts = CycleOpts {
         resolve,
         ..Default::default()
     };
-    let report = Report {
-        when: report::unix_now(),
-        repos: repos
-            .iter()
-            // Not cloned here yet (bootstrap pending): a non-event, like offline.
-            .filter(|repo| repo.expanded_path().is_dir())
-            .map(|repo| sync_repo(repo, &opts))
-            .collect(),
-    };
     let state = config::state_path();
     let prev = Report::load(&state);
+    let now = report::unix_now();
+    let cadence = Cadence {
+        idle_after: shared.idle_after_seconds,
+        idle_interval: shared.idle_interval_seconds,
+    };
+    let outcomes = repos
+        .iter()
+        // Not cloned here yet (bootstrap pending): a non-event, like offline.
+        .filter(|repo| repo.expanded_path().is_dir())
+        .map(|repo| {
+            // A dormant repo keeps its last outcome until the slow lane comes
+            // around. `resolve` is the user asking, so it always runs.
+            let previous = prev
+                .as_ref()
+                .and_then(|p| p.repos.iter().find(|r| r.repo == repo.name()))
+                .filter(|last| {
+                    !resolving
+                        && !cadence.due(&repo.expanded_path(), last.synced_at, now, &opts.env)
+                });
+            match previous {
+                Some(last) => last.clone(),
+                None => RepoOutcome {
+                    synced_at: now,
+                    ..sync_repo(repo, &opts)
+                },
+            }
+        })
+        .collect();
+    let mut report = Report {
+        when: now,
+        repos: outcomes,
+    };
+    // One-off auth failures are throttling, not a broken key: they only count
+    // once they repeat, so a flaky cycle stays out of status and notifications.
+    report.debounce_auth(prev.as_ref());
     notify_new_problems(prev.as_ref(), &report, &Env::default());
     report.save(&state)?;
     // Successful sync is silent; problems live in `jjsync status`.

@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
     pub interval_seconds: u64,
+    /// A repo with no jj operation for this long is dormant.
+    pub idle_after_seconds: u64,
+    /// How often a dormant repo still runs a cycle.
+    pub idle_interval_seconds: u64,
     pub repos: Vec<RepoConfig>,
     /// Repos to drop from the merged list, each entry a path or a directory
     /// name. Meant for config.local.json: "this machine opts out of X".
@@ -23,6 +27,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             interval_seconds: 60,
+            idle_after_seconds: 7 * 24 * 60 * 60,
+            idle_interval_seconds: 15 * 60,
             repos: vec![],
             ignore_repos: vec![],
         }

@@ -60,6 +60,12 @@ it stops syncing that bookmark, surfaces both positions, and waits for the user
 to resolve it explicitly. The only situation where synchronization requires a
 user decision.
 
+**Dormant repo** — a repository with no jj operation for a week: nobody has
+worked in it, and no cycle has moved anything either. It still syncs, just on a
+quarter-hour cadence instead of every timer tick, which keeps a fleet of idle
+repos from hammering the remote. A local edit, or a remote change once the next
+slow cycle adopts it, writes an operation and puts the repo back on every tick.
+
 **User bookmark** — any jj bookmark the user manages (`main`, feature branches).
 jjsync moves them only to mirror the user's own moves from another machine, and
 never publishes them to a project's normal branch namespace.

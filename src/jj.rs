@@ -43,6 +43,25 @@ impl<'a> Jj<'a> {
         Ok(out)
     }
 
+    /// Unix seconds of the newest operation: when the repo last changed.
+    /// A cycle where nothing moves creates no operation, so this stays put
+    /// through any number of quiet syncs. None when jj can't answer.
+    pub fn last_op_time(&self) -> Option<u64> {
+        let out = self
+            .run_raw(&[
+                "op",
+                "log",
+                "--no-graph",
+                "--ignore-working-copy",
+                "-n",
+                "1",
+                "-T",
+                r#"self.time().end().format("%s")"#,
+            ])
+            .ok()?;
+        out.ok().then(|| out.stdout.trim().parse().ok())?
+    }
+
     pub fn snapshot(&self) -> Result<()> {
         self.jj_ok(&["util", "snapshot"]).map(|_| ())
     }

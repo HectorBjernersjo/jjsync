@@ -92,6 +92,15 @@ pub struct RepoOutcome {
     pub synced_workspaces: Vec<String>,
     pub problems: Vec<Problem>,
     pub offline: bool,
+    /// Unix seconds of the cycle that produced this outcome. 0 in state
+    /// files from older versions; `Report::render` then falls back to the
+    /// report's own timestamp.
+    #[serde(default)]
+    pub synced_at: u64,
+    /// A first auth failure, held back by [`crate::report::Report::debounce_auth`]
+    /// until it repeats. Renders like `offline`: quiet, retried next cycle.
+    #[serde(default)]
+    pub auth_retrying: bool,
 }
 
 impl RepoOutcome {
@@ -101,7 +110,30 @@ impl RepoOutcome {
             synced_workspaces: vec![],
             problems: vec![Problem::Error { detail }],
             offline: false,
+            auth_retrying: false,
+            synced_at: 0,
         }
+    }
+}
+
+/// How often a repo runs a cycle. Every timer tick while it is being worked
+/// in; once per `idle_interval` when it isn't. A repo with no jj operation for
+/// `idle_after` is dormant, and syncing it every minute only burns SSH
+/// handshakes on a remote that has nothing new. Any local edit or adopted
+/// remote change writes an operation, which puts it back on every tick.
+pub struct Cadence {
+    pub idle_after: u64,
+    pub idle_interval: u64,
+}
+
+impl Cadence {
+    /// Whether `path` should run a cycle now, `last_synced` being the unix
+    /// second of its last one. A repo jj can't answer for syncs every tick.
+    pub fn due(&self, path: &Path, last_synced: u64, now: u64, env: &Env) -> bool {
+        now.saturating_sub(last_synced) >= self.idle_interval
+            || Jj::new(path, env)
+                .last_op_time()
+                .is_none_or(|t| now.saturating_sub(t) < self.idle_after)
     }
 }
 
@@ -320,6 +352,8 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
                 synced_workspaces: vec![],
                 problems,
                 offline: false,
+                auth_retrying: false,
+                synced_at: 0,
             }));
         }
         NetOutcome::Offline(_) => {
@@ -329,6 +363,8 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
                 synced_workspaces: vec![],
                 problems,
                 offline: true,
+                auth_retrying: false,
+                synced_at: 0,
             }));
         }
         NetOutcome::LeaseFailed(d) | NetOutcome::Other(d) => {
@@ -340,6 +376,8 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
                 synced_workspaces: vec![],
                 problems,
                 offline: false,
+                auth_retrying: false,
+                synced_at: 0,
             }));
         }
     }
@@ -644,6 +682,8 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
                     synced_workspaces: vec![],
                     problems,
                     offline: true,
+                    auth_retrying: false,
+                    synced_at: 0,
                 }));
             }
             NetOutcome::Other(d) => problems.push(Problem::Error {
@@ -673,6 +713,8 @@ fn cycle_attempt(cfg: &RepoConfig, opts: &CycleOpts, attempt: u32) -> Result<Att
         synced_workspaces: synced_ws.iter().map(|(n, _)| n.clone()).collect(),
         problems,
         offline: false,
+        auth_retrying: false,
+        synced_at: 0,
     }))
 }
 

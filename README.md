@@ -57,6 +57,8 @@ raise a desktop notification and show in `jjsync status`. Offline is a non-event
 ```json
 {
   "intervalSeconds": 60,
+  "idleAfterSeconds": 604800,
+  "idleIntervalSeconds": 900,
   "repos": [
     {
       "path": "/home/you/dotfiles",
@@ -69,6 +71,16 @@ raise a desktop notification and show in `jjsync status`. Offline is a non-event
   ]
 }
 ```
+
+A repo with no jj operation for `idleAfterSeconds` is dormant: nobody is
+working in it and no cycle has moved anything, so it runs one cycle every
+`idleIntervalSeconds` instead of every tick. Ten idle repos otherwise cost ten
+SSH handshakes a minute for nothing, and GitHub answers a rate-limited
+handshake with `Permission denied (publickey)`. Editing anything puts the repo
+back on the fast lane; `jjsync status` shows each repo's own last-sync age.
+A single auth failure is treated as that same throttling: it shows as
+`○ auth failed once (retrying)` and only becomes a ⚠ if the next cycle fails
+the same way.
 
 `config.json` is meant to be shared across machines (symlink it from your
 dotfiles): every machine acts on the same repo list, and `jjsync bootstrap`
